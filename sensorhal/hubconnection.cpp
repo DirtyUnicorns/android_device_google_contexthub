@@ -91,6 +91,11 @@ HubConnection *HubConnection::getInstance()
     return sInstance;
 }
 
+static bool isActivitySensor(int sensorIndex) {
+    return sensorIndex >= COMMS_SENSOR_ACTIVITY_FIRST
+        && sensorIndex <= COMMS_SENSOR_ACTIVITY_LAST;
+}
+
 HubConnection::HubConnection()
     : Thread(false /* canCallJava */),
       mRing(10 *1024),
@@ -172,8 +177,6 @@ HubConnection::HubConnection()
     mSensorState[COMMS_SENSOR_HALL].rate = SENSOR_RATE_ONCHANGE;
     mSensorState[COMMS_SENSOR_SYNC].sensorType = SENS_TYPE_VSYNC;
     mSensorState[COMMS_SENSOR_SYNC].rate = SENSOR_RATE_ONCHANGE;
-    mSensorState[COMMS_SENSOR_ACTIVITY].sensorType = SENS_TYPE_ACTIVITY;
-    mSensorState[COMMS_SENSOR_ACTIVITY].rate = SENSOR_RATE_ONCHANGE;
     mSensorState[COMMS_SENSOR_TILT].sensorType = SENS_TYPE_TILT;
     mSensorState[COMMS_SENSOR_TILT].rate = SENSOR_RATE_ONCHANGE;
     mSensorState[COMMS_SENSOR_GESTURE].sensorType = SENS_TYPE_GESTURE;
@@ -208,6 +211,10 @@ HubConnection::HubConnection()
     mSensorState[COMMS_SENSOR_ACTIVITY_STILL_STOP].rate = SENSOR_RATE_ONCHANGE;
     mSensorState[COMMS_SENSOR_ACTIVITY_TILTING].sensorType = SENS_TYPE_ACTIVITY_TILTING;
     mSensorState[COMMS_SENSOR_ACTIVITY_TILTING].rate = SENSOR_RATE_ONCHANGE;
+    mSensorState[COMMS_SENSOR_GAZE].sensorType = SENS_TYPE_GAZE;
+    mSensorState[COMMS_SENSOR_GAZE].rate = SENSOR_RATE_ONESHOT;
+    mSensorState[COMMS_SENSOR_UNGAZE].sensorType = SENS_TYPE_UNGAZE;
+    mSensorState[COMMS_SENSOR_UNGAZE].rate = SENSOR_RATE_ONESHOT;
 
 #ifdef LID_STATE_REPORTING_ENABLED
     initializeUinputNode();
@@ -408,9 +415,19 @@ void HubConnection::processSample(uint64_t timestamp, uint32_t type, uint32_t se
     int cnt = 0;
 
     switch (sensor) {
-    case COMMS_SENSOR_ACTIVITY:
+    case COMMS_SENSOR_ACTIVITY_IN_VEHICLE_START:
+    case COMMS_SENSOR_ACTIVITY_IN_VEHICLE_STOP:
+    case COMMS_SENSOR_ACTIVITY_ON_BICYCLE_START:
+    case COMMS_SENSOR_ACTIVITY_ON_BICYCLE_STOP:
+    case COMMS_SENSOR_ACTIVITY_WALKING_START:
+    case COMMS_SENSOR_ACTIVITY_WALKING_STOP:
+    case COMMS_SENSOR_ACTIVITY_RUNNING_START:
+    case COMMS_SENSOR_ACTIVITY_RUNNING_STOP:
+    case COMMS_SENSOR_ACTIVITY_STILL_START:
+    case COMMS_SENSOR_ACTIVITY_STILL_STOP:
+    case COMMS_SENSOR_ACTIVITY_TILTING:
         if (mActivityEventHandler != NULL) {
-            mActivityEventHandler->OnActivityEvent(sample->idata & 0x7,
+            mActivityEventHandler->OnActivityEvent(sensor, sample->idata & 0xff,
                                                    timestamp);
         }
         break;
@@ -439,6 +456,8 @@ void HubConnection::processSample(uint64_t timestamp, uint32_t type, uint32_t se
     case COMMS_SENSOR_WRIST_TILT:
         initEv(&nev[cnt++], timestamp, type, sensor)->data[0] = 1.0f;
         break;
+    case COMMS_SENSOR_GAZE:
+    case COMMS_SENSOR_UNGAZE:
     case COMMS_SENSOR_GESTURE:
     case COMMS_SENSOR_SYNC:
     case COMMS_SENSOR_DOUBLE_TOUCH:
@@ -687,6 +706,10 @@ void HubConnection::restoreSensorState()
     }
 
     mStepCounterOffset = mLastStepCount;
+
+    if (mActivityEventHandler != NULL) {
+        mActivityEventHandler->OnSensorHubReset();
+    }
 }
 
 void HubConnection::postOsLog(uint8_t *buf, ssize_t len)
@@ -714,7 +737,7 @@ void HubConnection::postOsLog(uint8_t *buf, ssize_t len)
     }
 }
 
-ssize_t HubConnection::processBuf(uint8_t *buf, ssize_t len)
+ssize_t HubConnection::processBuf(uint8_t *buf, size_t len)
 {
     struct nAxisEvent *data = (struct nAxisEvent *)buf;
     uint32_t type, sensor, bias, currSensor;
@@ -724,7 +747,7 @@ ssize_t HubConnection::processBuf(uint8_t *buf, ssize_t len)
     uint64_t timestamp;
     ssize_t ret = 0;
 
-    if (len >= 4) {
+    if (len >= sizeof(data->evtType)) {
         ret = sizeof(data->evtType);
         one = three = rawThree = false;
         bias = 0;
@@ -771,7 +794,9 @@ ssize_t HubConnection::processBuf(uint8_t *buf, ssize_t len)
             one = true;
             break;
         case SENS_TYPE_TO_EVENT(SENS_TYPE_TEMP):
-            type = SENSOR_TYPE_AMBIENT_TEMPERATURE;
+            // nanohub only has one temperature sensor type, which is mapped to
+            // internal temp because we currently don't have ambient temp
+            type = SENSOR_TYPE_INTERNAL_TEMPERATURE;
             sensor = COMMS_SENSOR_TEMPERATURE;
             one = true;
             break;
@@ -833,11 +858,6 @@ ssize_t HubConnection::processBuf(uint8_t *buf, ssize_t len)
         case SENS_TYPE_TO_EVENT(SENS_TYPE_VSYNC):
             type = SENSOR_TYPE_SYNC;
             sensor = COMMS_SENSOR_SYNC;
-            one = true;
-            break;
-        case SENS_TYPE_TO_EVENT(SENS_TYPE_ACTIVITY):
-            type = 0;
-            sensor = COMMS_SENSOR_ACTIVITY;
             one = true;
             break;
         case SENS_TYPE_TO_EVENT(SENS_TYPE_TILT):
@@ -925,6 +945,16 @@ ssize_t HubConnection::processBuf(uint8_t *buf, ssize_t len)
             sensor = COMMS_SENSOR_ACTIVITY_TILTING;
             one = true;
             break;
+        case SENS_TYPE_TO_EVENT(SENS_TYPE_GAZE):
+            type = SENSOR_TYPE_GAZE;
+            sensor = COMMS_SENSOR_GAZE;
+            one = true;
+            break;
+        case SENS_TYPE_TO_EVENT(SENS_TYPE_UNGAZE):
+            type = SENSOR_TYPE_UNGAZE;
+            sensor = COMMS_SENSOR_UNGAZE;
+            one = true;
+            break;
         case EVT_RESET_REASON:
             uint32_t resetReason;
             memcpy(&resetReason, data->buffer, sizeof(resetReason));
@@ -932,11 +962,15 @@ ssize_t HubConnection::processBuf(uint8_t *buf, ssize_t len)
             restoreSensorState();
             return 0;
         default:
-            return 0;
+            ALOGE("unknown evtType: 0x%08x\n", data->evtType);
+            return -1;
         }
+    } else {
+        ALOGE("too little data: len=%zu\n", len);
+        return -1;
     }
 
-    if (len >= 16) {
+    if (len >= sizeof(data->evtType) + sizeof(data->referenceTime) + sizeof(data->firstSample)) {
         ret += sizeof(data->referenceTime);
         timestamp = data->referenceTime;
         numSamples = data->firstSample.numSamples;
@@ -947,20 +981,35 @@ ssize_t HubConnection::processBuf(uint8_t *buf, ssize_t len)
                 currSensor = sensor;
 
             if (one) {
+                if (ret + sizeof(data->oneSamples[i]) > len) {
+                    ALOGE("sensor %d (one): ret=%zd, numSamples=%d, i=%d\n", currSensor, ret, numSamples, i);
+                    return -1;
+                }
                 if (i > 0)
                     timestamp += ((uint64_t)data->oneSamples[i].deltaTime) << delta_time_shift_table[data->oneSamples[i].deltaTime & delta_time_encoded];
                 processSample(timestamp, type, currSensor, &data->oneSamples[i], data->firstSample.highAccuracy);
                 ret += sizeof(data->oneSamples[i]);
             } else if (rawThree) {
+                if (ret + sizeof(data->rawThreeSamples[i]) > len) {
+                    ALOGE("sensor %d (rawThree): ret=%zd, numSamples=%d, i=%d\n", currSensor, ret, numSamples, i);
+                    return -1;
+                }
                 if (i > 0)
                     timestamp += ((uint64_t)data->rawThreeSamples[i].deltaTime) << delta_time_shift_table[data->rawThreeSamples[i].deltaTime & delta_time_encoded];
                 processSample(timestamp, type, currSensor, &data->rawThreeSamples[i], data->firstSample.highAccuracy);
                 ret += sizeof(data->rawThreeSamples[i]);
             } else if (three) {
+                if (ret + sizeof(data->threeSamples[i]) > len) {
+                    ALOGE("sensor %d (three): ret=%zd, numSamples=%d, i=%d\n", currSensor, ret, numSamples, i);
+                    return -1;
+                }
                 if (i > 0)
                     timestamp += ((uint64_t)data->threeSamples[i].deltaTime) << delta_time_shift_table[data->threeSamples[i].deltaTime & delta_time_encoded];
                 processSample(timestamp, type, currSensor, &data->threeSamples[i], data->firstSample.highAccuracy);
                 ret += sizeof(data->threeSamples[i]);
+            } else {
+                ALOGE("sensor %d (unknown): cannot processSample\n", currSensor);
+                return -1;
             }
         }
 
@@ -968,10 +1017,8 @@ ssize_t HubConnection::processBuf(uint8_t *buf, ssize_t len)
             ret += sizeof(data->firstSample);
 
         for (i=0; i<data->firstSample.numFlushes; i++) {
-            if (sensor == COMMS_SENSOR_ACTIVITY) {
-                if (mActivityEventHandler != NULL) {
-                    mActivityEventHandler->OnFlush();
-                }
+            if (isActivitySensor(sensor) && mActivityEventHandler != NULL) {
+                mActivityEventHandler->OnFlush();
             } else {
                 memset(&ev, 0x00, sizeof(sensors_event_t));
                 ev.version = META_DATA_VERSION;
@@ -991,6 +1038,9 @@ ssize_t HubConnection::processBuf(uint8_t *buf, ssize_t len)
                 ALOGI("flushing %d", ev.meta_data.sensor);
             }
         }
+    } else {
+        ALOGE("too little data for sensor %d: len=%zu\n", sensor, len);
+        return -1;
     }
 
     return ret;
@@ -1106,13 +1156,17 @@ bool HubConnection::threadLoop() {
             uint8_t recv[256];
             ssize_t len = ::read(mFd, recv, sizeof(recv));
 
-            for (ssize_t offset = 0; offset < len;) {
-                ret = processBuf(recv + offset, len - offset);
+            if (len >= 0) {
+                for (ssize_t offset = 0; offset < len;) {
+                    ret = processBuf(recv + offset, len - offset);
 
-                if (ret > 0)
-                    offset += ret;
-                else
-                    break;
+                    if (ret > 0)
+                        offset += ret;
+                    else
+                        break;
+                }
+            } else {
+                ALOGE("read -1: errno=%d\n", errno);
             }
         }
     }
@@ -1259,12 +1313,13 @@ void HubConnection::queueFlush(int handle)
         cmd.cmd = CONFIG_CMD_FLUSH;
 
         ret = TEMP_FAILURE_RETRY(write(mFd, &cmd, sizeof(cmd)));
-        if (ret == sizeof(cmd))
+        if (ret == sizeof(cmd)) {
             ALOGI("queueFlush: sensor=%d, handle=%d",
                     cmd.sensorType, handle);
-        else
-            ALOGE("queueFlush: failed to send command: sensor=%d, handle=%d",
-                    cmd.sensorType, handle);
+        } else {
+            ALOGE("queueFlush: failed to send command: sensor=%d, handle=%d"
+                  " with error %s", cmd.sensorType, handle, strerror(errno));
+        }
     } else {
         ALOGI("queueFlush: unhandled handle=%d", handle);
     }

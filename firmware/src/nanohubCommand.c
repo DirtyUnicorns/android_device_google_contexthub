@@ -25,6 +25,7 @@
 #include <plat/inc/taggedPtr.h>
 #include <plat/inc/bl.h>
 #include <plat/inc/plat.h>
+#include <plat/inc/wdt.h>
 
 #include <nanohub/crc.h>
 #include <nanohub/rsa.h>
@@ -313,10 +314,13 @@ static void deferredUpdateOs(void *cookie)
     // some sanity checks before asking BL to do image lookup
     hostIntfSetBusy(true);
     if (segSize >= (sizeof(*app) + sizeof(*os)) && segSize > os->size) {
-        if (osWriteShared(&os->marker, &marker, sizeof(os->marker)))
+        if (osWriteShared(&os->marker, &marker, sizeof(os->marker))) {
+            wdtDisableClk();
             uploadStatus = BL.blVerifyOsUpdate();
-        else
+            wdtEnableClk();
+        } else {
             osLog(LOG_ERROR, "%s: could not set marker on OS image\n", __func__);
+        }
     }
     hostIntfSetBusy(false);
     osLog(LOG_INFO, "%s: status=%" PRIu32 "\n", __func__, uploadStatus);
@@ -512,6 +516,7 @@ static void firmwareWrite(void *cookie)
         return;
     } else if (valid) {
         if (mDownloadState->srcOffset == mDownloadState->size) {
+            mAppSecStatus = appSecRxDataOver(mDownloadState->appSecState);
             finished = true;
             valid = !checkCrc || mDownloadState->crc == ~mDownloadState->srcCrc;
         } else if (mDownloadState->srcOffset > mDownloadState->size) {
@@ -532,7 +537,7 @@ static void firmwareWrite(void *cookie)
 
 static uint32_t doFirmwareChunk(uint8_t *data, uint32_t offset, uint32_t len, void *cookie)
 {
-    uint32_t reply;
+    uint32_t reply, ret;
 
     if (!mDownloadState) {
         reply = NANOHUB_FIRMWARE_CHUNK_REPLY_CANCEL_NO_RETRY;
@@ -544,8 +549,11 @@ static uint32_t doFirmwareChunk(uint8_t *data, uint32_t offset, uint32_t len, vo
     } else {
         if (mDownloadState->erase == true) {
             reply = NANOHUB_FIRMWARE_CHUNK_REPLY_WAIT;
-            if (!mDownloadState->eraseScheduled)
+            if (!mDownloadState->eraseScheduled) {
+                ret = osExtAppStopApps(APP_ID_ANY);
+                osLog(LOG_INFO, "%s: unloaded apps, ret=%08lx\n", __func__, ret);
                 mDownloadState->eraseScheduled = osDefer(firmwareErase, NULL, false);
+            }
         } else if (!mDownloadState->start) {
             // this means we can't allocate enough space even after we did erase
             reply = NANOHUB_FIRMWARE_CHUNK_REPLY_CANCEL_NO_RETRY;
